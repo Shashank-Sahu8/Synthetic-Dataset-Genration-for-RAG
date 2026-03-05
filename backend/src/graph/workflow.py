@@ -1,23 +1,24 @@
 """
-Full LangGraph pipeline: Batch Formation → QA Generation → RAGAS Evaluation → Persist.
+Parent LangGraph pipeline: orchestrates the three subgraphs.
 
-Graph topology
-──────────────
-START
-  ↓
-create_batch              (slice pages, persist Batch row)
-  ↓
-create_batch_context      (LLM dense context, persist to DB)
-  ↓
-generate_dataset          (LLM produces N QA pairs)
-  ↓
-evaluate_dataset          (RAGAS faithfulness scoring)
-  ↓ (conditional: should_regenerate_or_persist)
-  ├─ "regenerate"  ──────────────────────→ generate_dataset  (max 3 attempts)
-  └─ "persist"     → persist_dataset
-                     ↓ (conditional: should_continue_pipeline)
-                     ├─ "create_batch" → create_batch  (next batch, loop)
-                     └─ "end"          → END
+Each subgraph handles one phase of the pipeline:
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  batch_context_subgraph                                             │
+  │  START → create_batch → create_batch_context → END                 │
+  └─────────────────────────────────────────────────────────────────────┘
+            ↓
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  qa_generation_subgraph                                             │
+  │  START → generate_dataset → evaluate_dataset → (regenerate|END)    │
+  └─────────────────────────────────────────────────────────────────────┘
+            ↓
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  persist_subgraph                                                   │
+  │  START → persist_dataset → END                                      │
+  └─────────────────────────────────────────────────────────────────────┘
+            ↓ (conditional: should_continue_pipeline)
+            ├─ "batch_context" ──→ batch_context_subgraph  (next batch)
+            └─ "end"           ──→ END
 """
 from __future__ import annotations
 
@@ -27,57 +28,46 @@ from typing import Any
 from langgraph.graph import StateGraph, END
 
 from backend.src.graph.state import GraphState, PageData, initial_state
-from backend.src.graph.nodes import (
-    create_batch_node,
-    create_batch_context_node,
-    generate_dataset_node,
-    evaluate_dataset_node,
-    persist_dataset_node,
-    should_regenerate_or_persist,
-    should_continue_pipeline,
-)
+from backend.src.graph.subgraphs.batch_context import build_batch_context_subgraph
+from backend.src.graph.subgraphs.qa_generation import build_qa_generation_subgraph
+from backend.src.graph.subgraphs.persist import build_persist_subgraph
+from backend.src.graph.subgraphs.persist.nodes import should_continue_pipeline
 
 logger = logging.getLogger(__name__)
 
 
-def _build_graph() -> Any:
-    """Compile and return the full LangGraph StateGraph."""
+def _build_parent_graph() -> Any:
+    """
+    Compile the parent graph that wires the three subgraphs together.
+
+    The subgraphs are compiled once and added as opaque nodes; all three
+    share the same GraphState TypedDict so state flows through seamlessly.
+    """
+    batch_context_sg = build_batch_context_subgraph()
+    qa_generation_sg = build_qa_generation_subgraph()
+    persist_sg       = build_persist_subgraph()
+
     builder = StateGraph(GraphState)
 
-    # ── Register all nodes ────────────────────────────────────────────────
-    builder.add_node("create_batch",         create_batch_node)
-    builder.add_node("create_batch_context", create_batch_context_node)
-    builder.add_node("generate_dataset",     generate_dataset_node)
-    builder.add_node("evaluate_dataset",     evaluate_dataset_node)
-    builder.add_node("persist_dataset",      persist_dataset_node)
+    # ── Register compiled subgraphs as nodes ─────────────────────────────────
+    builder.add_node("batch_context",  batch_context_sg)
+    builder.add_node("qa_generation",  qa_generation_sg)
+    builder.add_node("persist",        persist_sg)
 
-    # ── Entry point ───────────────────────────────────────────────────────
-    builder.set_entry_point("create_batch")
+    # ── Entry point ───────────────────────────────────────────────────────────
+    builder.set_entry_point("batch_context")
 
-    # ── Phase 1: fixed edges ──────────────────────────────────────────────
-    builder.add_edge("create_batch",         "create_batch_context")
-    builder.add_edge("create_batch_context", "generate_dataset")
+    # ── Fixed edges: batch → qa → persist ────────────────────────────────────
+    builder.add_edge("batch_context", "qa_generation")
+    builder.add_edge("qa_generation", "persist")
 
-    # ── Phase 2 → 3: fixed edge ───────────────────────────────────────────
-    builder.add_edge("generate_dataset", "evaluate_dataset")
-
-    # ── Phase 3 → conditional: regenerate or persist ──────────────────────
+    # ── Conditional edge after persist: next batch or END ────────────────────
     builder.add_conditional_edges(
-        "evaluate_dataset",
-        should_regenerate_or_persist,
-        {
-            "regenerate": "generate_dataset",
-            "persist":    "persist_dataset",
-        },
-    )
-
-    # ── Phase 4 → conditional: next batch or end ──────────────────────────
-    builder.add_conditional_edges(
-        "persist_dataset",
+        "persist",
         should_continue_pipeline,
         {
-            "create_batch": "create_batch",
-            "end":          END,
+            "batch_context": "batch_context",
+            "end":           END,
         },
     )
 
@@ -85,30 +75,31 @@ def _build_graph() -> Any:
 
 
 # Compile once at import time
-_graph = _build_graph()
+_graph = _build_parent_graph()
 
 
 def run_full_pipeline(
-    project_id: str,
+    project_id:  str,
     document_id: str,
-    doc_id: str,
-    pages: list[dict],          # list of {"page_no": int, "text": str}
-    batch_size: int = 5,
-    overlap: int = 1,
+    doc_id:      str,
+    pages:       list[dict],   # [{"page_no": int, "text": str}]
+    batch_size:  int = 5,
+    overlap:     int = 1,
 ) -> GraphState:
     """
     Public entry-point called by the ingest route's background thread.
 
-    Runs the complete pipeline (Phase 1-4) synchronously within the background
-    thread until all pages have been processed and DatasetEntry rows persisted.
+    Executes the complete pipeline (Phases 1-4) synchronously, iterating
+    over every batch until all pages are processed and DatasetEntry rows
+    are persisted.
 
-    Returns the final GraphState after the graph terminates.
+    Returns the final GraphState.
     """
     page_data: list[PageData] = [
         {"page_no": p["page_no"], "text": p["text"]} for p in pages
     ]
 
-    state: GraphState = initial_state(
+    state = initial_state(
         project_id=project_id,
         document_id=document_id,
         doc_id=doc_id,
@@ -118,23 +109,19 @@ def run_full_pipeline(
     )
 
     logger.info(
-        "Full pipeline START  doc_id=%s  total_pages=%d  batch_size=%d  overlap=%d",
-        doc_id,
-        len(page_data),
-        batch_size,
-        overlap,
+        "Pipeline START  doc_id=%s  total_pages=%d  batch_size=%d  overlap=%d",
+        doc_id, len(page_data), batch_size, overlap,
     )
 
     final_state: GraphState = _graph.invoke(state)
 
     logger.info(
-        "Full pipeline END  doc_id=%s  validated_qa_pairs=%d",
-        doc_id,
-        len(final_state.get("validated_dataset", [])),
+        "Pipeline END  doc_id=%s  validated_qa_pairs=%d",
+        doc_id, len(final_state.get("validated_dataset", [])),
     )
 
     return final_state
 
 
-# Keep backward-compat alias so any code still importing run_phase1_pipeline works
+# Backward-compat alias
 run_phase1_pipeline = run_full_pipeline
