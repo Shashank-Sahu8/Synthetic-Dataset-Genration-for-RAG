@@ -1,0 +1,64 @@
+# Source control
+.git
+.gitignore
+
+# Docker configuration
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker-compose.*.yml
+
+# Environment and secrets
+.env
+.env.*
+
+# Documentation
+*.md
+docs/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual Environments
+.venv
+env/
+venv/
+ENV/
+
+# Testing & Coverage
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+tests/
+
+# Editor & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local DB & Vector Storage (Prevents large build context context size)
+langgraph_db/
+vector_store/
+faiss_index/
+chroma_db/
+qdrant_storage/
+data/db/
+db/
+mongo_data/
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
