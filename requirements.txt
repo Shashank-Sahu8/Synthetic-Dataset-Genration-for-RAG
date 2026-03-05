@@ -1,10 +1,13 @@
-langgraph>=0.0.26
-langchain>=0.1.12
-langchain-core>=0.1.31
-langchain-community>=0.0.28
-langchain-openai>=0.0.8
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0
 
+litellm>=1.40.0
 openai>=1.14.0
+ragas>=0.2.0
+datasets>=2.18.0
 
 sqlalchemy>=2.0.29
 alembic>=1.13.1
@@ -19,3 +22,6 @@ pydantic>=2.6.4
 python-dotenv>=1.0.1
 
 requests>=2.31.0
+
+# Streamlit frontend
+streamlit>=1.32.0

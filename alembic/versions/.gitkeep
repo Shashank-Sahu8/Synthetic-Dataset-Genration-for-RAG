@@ -1,0 +1,2 @@
+# Migration version files are generated here by Alembic.
+# Run: alembic revision --autogenerate -m "initial"
